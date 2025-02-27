@@ -101,6 +101,27 @@ app.get('/view-scripts', async (req, res) => {
     }
 });
 
+app.get('/manually-install', async (req, res) => {
+
+    const response = await axios.post(
+        `https://${process.env.SHOP}/admin/api/2023-10/script_tags.json`,
+        {
+            script_tag: {
+                event: 'onload',
+                src: `${process.env.HOST}/po-number-prefill.js`,
+                display_scope: 'online_store' // Try setting this explicitly
+            }
+        },
+        {
+            headers: {
+                'X-Shopify-Access-Token': process.env.ADMIN_API_ACCESS_TOKEN,
+                'Content-Type': 'application/json'
+            }
+        }
+    );
+});
+
+
 // Start the server
 app.listen(port, () => {
     console.log(`PO Number Prefill App listening at http://localhost:${port}`);
