@@ -54,7 +54,8 @@ app.get('/install-script', async (req, res) => {
         const createResponse = await axios.post(`https://${process.env.SHOP}/admin/api/2023-01/script_tags.json`, {
             script_tag: {
                 event: 'onload',
-                src: `${process.env.HOST}/po-number-prefill.js`
+                src: `${process.env.HOST}/po-number-prefill.js`,
+                display_scope: 'all'
             }
         }, {
             headers: {
@@ -101,25 +102,7 @@ app.get('/view-scripts', async (req, res) => {
     }
 });
 
-app.get('/manually-install', async (req, res) => {
 
-    const response = await axios.post(
-        `https://${process.env.SHOP}/admin/api/2023-10/script_tags.json`,
-        {
-            script_tag: {
-                event: 'onload',
-                src: `${process.env.HOST}/po-number-prefill.js`,
-                display_scope: 'online_store' // Try setting this explicitly
-            }
-        },
-        {
-            headers: {
-                'X-Shopify-Access-Token': process.env.ADMIN_API_ACCESS_TOKEN,
-                'Content-Type': 'application/json'
-            }
-        }
-    );
-});
 
 
 // Start the server
