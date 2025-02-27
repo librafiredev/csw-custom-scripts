@@ -1,60 +1,101 @@
 // app.js
 require('dotenv').config();
 const express = require('express');
-const { Shopify, ApiVersion } = require('@shopify/shopify-api');
+const axios = require('axios');
+const crypto = require('crypto');
+const cookieParser = require('cookie-parser');
+const session = require('express-session');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Initialize Shopify API client
-Shopify.Context.initialize({
-    API_KEY: process.env.SHOPIFY_API_KEY,
-    API_SECRET_KEY: process.env.SHOPIFY_API_SECRET,
-    SCOPES: process.env.SCOPES.split(','),
-    HOST_NAME: process.env.HOST.replace(/https:\/\//, ''),
-    API_VERSION: ApiVersion.October23,
-    IS_EMBEDDED_APP: false
-});
-
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(session({
+    secret: crypto.randomBytes(16).toString('hex'),
+    resave: false,
+    saveUninitialized: true
+}));
 
-// Serve static files for the script
+// Serve static files
 app.use(express.static('public'));
 
-// Authentication routes
-app.get('/auth', async (req, res) => {
-    if (!req.query.shop) {
-        return res.status(400).send('Missing shop parameter. Please add ?shop=your-store.myshopify.com to the URL.');
+// Authentication route
+app.get('/auth', (req, res) => {
+    const shop = req.query.shop || process.env.SHOP;
+    if (!shop) {
+        return res.status(400).send('Missing shop parameter');
     }
 
-    const shop = req.query.shop;
+    // Generate a random nonce
+    const nonce = crypto.randomBytes(16).toString('hex');
 
-    // Create a new OAuth process
-    const authUrl = await Shopify.Auth.beginAuth(
-        req, res, shop, '/auth/callback', false
-    );
+    // Store shop and nonce in session
+    req.session.shop = shop;
+    req.session.nonce = nonce;
+
+    // Construct the authentication URL
+    const redirectUri = `${process.env.HOST}/auth/callback`;
+    const scopes = 'write_script_tags,read_orders';
+    const authUrl = `https://${shop}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=${nonce}`;
 
     res.redirect(authUrl);
 });
 
+// Auth callback
 app.get('/auth/callback', async (req, res) => {
-    try {
-        const session = await Shopify.Auth.validateAuthCallback(
-            req, res, req.query
-        );
+    const { shop, hmac, code, state } = req.query;
+    const { nonce, shop: storedShop } = req.session;
 
-        // Store the session for later use
-        console.log('Authentication successful for shop:', session.shop);
+    // Verify the shop
+    if (shop !== storedShop) {
+        return res.status(400).send('Shop does not match');
+    }
+
+    // Verify the nonce
+    if (state !== nonce) {
+        return res.status(400).send('Request origin cannot be verified');
+    }
+
+    // Calculate the HMAC
+    const message = Object.entries(req.query)
+        .filter(([key]) => key !== 'hmac')
+        .map(([key, value]) => `${key}=${value}`)
+        .sort()
+        .join('&');
+
+    const generatedHash = crypto
+        .createHmac('sha256', process.env.SHOPIFY_API_SECRET)
+        .update(message)
+        .digest('hex');
+
+    // Verify the HMAC
+    if (generatedHash !== hmac) {
+        return res.status(400).send('HMAC validation failed');
+    }
+
+    try {
+        // Exchange the code for an access token
+        const response = await axios.post(`https://${shop}/admin/oauth/access_token`, {
+            client_id: process.env.SHOPIFY_API_KEY,
+            client_secret: process.env.SHOPIFY_API_SECRET,
+            code
+        });
+
+        // Store the access token in the session
+        req.session.accessToken = response.data.access_token;
+        req.session.shop = shop;
 
         res.redirect('/success');
     } catch (error) {
-        console.error('Error during authentication:', error);
-        res.status(500).send('Authentication failed: ' + error.message);
+        console.error('Error getting access token:', error);
+        res.status(500).send('Error getting access token');
     }
 });
 
+// Success page
 app.get('/success', (req, res) => {
     res.send(`
     <h1>Authentication successful!</h1>
@@ -63,42 +104,51 @@ app.get('/success', (req, res) => {
   `);
 });
 
-// Script tag installation endpoint
+// Install script tag
 app.get('/install-script', async (req, res) => {
+    const { accessToken, shop } = req.session;
+
+    if (!accessToken || !shop) {
+        return res.redirect(`/auth?shop=${process.env.SHOP}`);
+    }
+
     try {
-        // Get the current session
-        const session = await Shopify.Utils.loadCurrentSession(req, res);
-
-        if (!session) {
-            return res.redirect(`/auth?shop=${process.env.SHOP}`);
-        }
-
-        // Check if script tag already exists
-        const existingScriptTags = await Shopify.REST.ScriptTag.all({
-            session,
+        // First, get existing script tags
+        const getResponse = await axios.get(`https://${shop}/admin/api/2022-10/script_tags.json`, {
+            headers: {
+                'X-Shopify-Access-Token': accessToken
+            }
         });
 
-        // Delete existing script tags with the same source
-        for (const tag of existingScriptTags.data) {
-            if (tag.src.includes('po-number-prefill.js')) {
-                await Shopify.REST.ScriptTag.delete({
-                    session,
-                    id: tag.id,
-                });
-                console.log(`Deleted existing script tag: ${tag.id}`);
-            }
+        // Check for existing script tags with our URL
+        const existingTags = getResponse.data.script_tags.filter(tag =>
+            tag.src.includes('po-number-prefill.js')
+        );
+
+        // Delete existing tags
+        for (const tag of existingTags) {
+            await axios.delete(`https://${shop}/admin/api/2022-10/script_tags/${tag.id}.json`, {
+                headers: {
+                    'X-Shopify-Access-Token': accessToken
+                }
+            });
+            console.log(`Deleted script tag ${tag.id}`);
         }
 
         // Create a new script tag
-        const scriptTag = new Shopify.REST.ScriptTag({ session });
-        scriptTag.event = "onload";
-        scriptTag.src = `${process.env.HOST}/po-number-prefill.js`;
-
-        await scriptTag.save({
-            update: true,
+        const createResponse = await axios.post(`https://${shop}/admin/api/2022-10/script_tags.json`, {
+            script_tag: {
+                event: 'onload',
+                src: `${process.env.HOST}/po-number-prefill.js`
+            }
+        }, {
+            headers: {
+                'X-Shopify-Access-Token': accessToken,
+                'Content-Type': 'application/json'
+            }
         });
 
-        console.log(`Script tag installed successfully for shop: ${session.shop}`);
+        console.log('Script tag created:', createResponse.data.script_tag);
 
         res.send(`
       <h1>Script Tag Installed Successfully</h1>
@@ -113,29 +163,30 @@ app.get('/install-script', async (req, res) => {
     }
 });
 
-// Endpoint to view all script tags
+// View script tags
 app.get('/view-scripts', async (req, res) => {
+    const { accessToken, shop } = req.session;
+
+    if (!accessToken || !shop) {
+        return res.redirect(`/auth?shop=${process.env.SHOP}`);
+    }
+
     try {
-        const session = await Shopify.Utils.loadCurrentSession(req, res);
-
-        if (!session) {
-            return res.redirect(`/auth?shop=${process.env.SHOP}`);
-        }
-
-        const scriptTags = await Shopify.REST.ScriptTag.all({
-            session,
+        const response = await axios.get(`https://${shop}/admin/api/2022-10/script_tags.json`, {
+            headers: {
+                'X-Shopify-Access-Token': accessToken
+            }
         });
 
-        let response = '<h1>Installed Script Tags</h1><ul>';
+        let html = '<h1>Installed Script Tags</h1><ul>';
 
-        scriptTags.data.forEach(tag => {
-            response += `<li>ID: ${tag.id} - Source: ${tag.src} - Event: ${tag.event}</li>`;
+        response.data.script_tags.forEach(tag => {
+            html += `<li>ID: ${tag.id} - Source: ${tag.src} - Event: ${tag.event}</li>`;
         });
 
-        response += '</ul>';
-        response += '<a href="/">Return to home</a>';
+        html += '</ul><a href="/">Home</a>';
 
-        res.send(response);
+        res.send(html);
     } catch (error) {
         console.error('Error fetching script tags:', error);
         res.status(500).send(`Error fetching script tags: ${error.message}`);
@@ -155,9 +206,7 @@ app.get('/', (req, res) => {
   `);
 });
 
-
 // Start the server
 app.listen(port, () => {
     console.log(`PO Number Prefill App listening at http://localhost:${port}`);
-    console.log(`Set up to work with shop: ${process.env.SHOP}`);
 });
